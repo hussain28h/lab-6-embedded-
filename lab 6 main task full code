@@ -1,0 +1,206 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+#include "user_interface.h"
+#include "code.h"
+#include "siren.h"
+#include "smart_home_system.h"
+#include "fire_alarm.h"
+#include "date_and_time.h"
+#include "temperature_sensor.h"
+#include "gas_sensor.h"
+#include "matrix_keypad.h"
+#include "display.h"
+
+// --- Settings ---
+#define DISPLAY_REFRESH_INTERVAL 1000
+
+// --- Hardware outputs ---
+DigitalOut incorrectCodeLed(LED3);
+DigitalOut systemBlockedLed(LED2);
+
+// --- Shared code buffer ---
+char codeSequenceFromUserInterface[CODE_NUMBER_OF_KEYS];
+
+// --- Internal state ---
+static bool incorrectCodeState = OFF;
+static bool systemBlockedState = OFF;
+static bool codeComplete = false;
+static int codeCharIndex = 0;
+
+static bool showWelcomeMsg = true;
+static int welcomeTimer = 5000;
+static int temporaryViewType = 0;  // 0: off, 1: gas, 2: temp
+static int temporaryViewTimer = 0;
+static int alarmPromptCountdown = 0;
+
+// --- Internal function headers ---
+static void handleKeypadInput();
+static void updateIncorrectCodeLed();
+static void updateSystemBlockedLed();
+static void initDisplay();
+static void refreshDisplay();
+
+void userInterfaceInit()
+{
+    incorrectCodeLed = OFF;
+    systemBlockedLed = OFF;
+    matrixKeypadInit(SYSTEM_TIME_INCREMENT_MS);
+    initDisplay();
+}
+
+void userInterfaceUpdate()
+{
+    handleKeypadInput();
+    updateIncorrectCodeLed();
+    updateSystemBlockedLed();
+    refreshDisplay();
+}
+
+// --- Accessor/setters for other modules ---
+bool incorrectCodeStateRead() { return incorrectCodeState; }
+void incorrectCodeStateWrite(bool state) { incorrectCodeState = state; }
+
+bool systemBlockedStateRead() { return systemBlockedState; }
+void systemBlockedStateWrite(bool state) { systemBlockedState = state; }
+
+bool userInterfaceCodeCompleteRead() { return codeComplete; }
+void userInterfaceCodeCompleteWrite(bool state) { codeComplete = state; }
+
+// --- Keypad input and code handling ---
+static void handleKeypadInput()
+{
+    static int hashCount = 0;
+    char releasedKey = matrixKeypadUpdate();
+
+    if (releasedKey != '\0') {
+        bool alarmActive = sirenStateRead();
+        bool systemLocked = systemBlockedStateRead();
+
+        if (!alarmActive && !systemLocked) {
+            if (releasedKey == '2') {
+                temporaryViewType = 1;
+                temporaryViewTimer = 5000;
+            } else if (releasedKey == '3') {
+                temporaryViewType = 2;
+                temporaryViewTimer = 5000;
+            }
+        } else if (alarmActive && !systemLocked) {
+            if (!incorrectCodeState) {
+                codeSequenceFromUserInterface[codeCharIndex++] = releasedKey;
+                if (codeCharIndex >= CODE_NUMBER_OF_KEYS) {
+                    codeComplete = true;
+                    codeCharIndex = 0;
+                }
+            } else if (releasedKey == '#') {
+                hashCount++;
+                if (hashCount >= 2) {
+                    incorrectCodeState = OFF;
+                    codeCharIndex = 0;
+                    codeComplete = false;
+                    hashCount = 0;
+                }
+            }
+        }
+    }
+}
+
+// --- Display initialization ---
+static void initDisplay()
+{
+    displayInit(DISPLAY_CONNECTION_I2C_PCF8574_IO_EXPANDER);
+    displayCharPositionWrite(0, 0); displayStringWrite("Temperature:");
+    displayCharPositionWrite(0, 1); displayStringWrite("Gas:");
+    displayCharPositionWrite(0, 2); displayStringWrite("Alarm:");
+}
+
+// --- Periodic display refresh logic ---
+static void refreshDisplay()
+{
+    static int elapsedTime = 0;
+
+    if (showWelcomeMsg) {
+        welcomeTimer -= SYSTEM_TIME_INCREMENT_MS;
+        if (welcomeTimer <= 0) showWelcomeMsg = false;
+    }
+
+    if (temporaryViewTimer > 0) {
+        temporaryViewTimer -= SYSTEM_TIME_INCREMENT_MS;
+        if (temporaryViewTimer <= 0) {
+            temporaryViewType = 0;
+        }
+    }
+
+    if (elapsedTime >= DISPLAY_REFRESH_INTERVAL) {
+        elapsedTime = 0;
+
+        // Line 0 - Temperature
+        char tempStr[10];
+        sprintf(tempStr, "%.0f", temperatureSensorReadCelsius());
+        displayCharPositionWrite(12, 0); displayStringWrite(tempStr);
+        displayCharPositionWrite(14, 0); displayStringWrite("'C");
+
+        // Line 1 - Gas
+        displayCharPositionWrite(4, 1);
+        gasDetectorStateRead() ? displayStringWrite("Detected    ") : displayStringWrite("Not Detected");
+
+        // Line 2 - Alarm state
+        displayCharPositionWrite(6, 2);
+        sirenStateRead() ? displayStringWrite("ON ") : displayStringWrite("OFF");
+
+        // Line 3 - Dynamic feedback
+        displayCharPositionWrite(0, 3);
+        if (sirenStateRead()) {
+            if (alarmPromptCountdown < 3000) {
+                alarmPromptCountdown += DISPLAY_REFRESH_INTERVAL;
+                if (overTemperatureDetectedRead() && gasDetectedRead()) {
+                    displayStringWrite("DANGER: Temp+Gas!");
+                } else if (overTemperatureDetectedRead()) {
+                    displayStringWrite("DANGER: High Temp");
+                } else if (gasDetectedRead()) {
+                    displayStringWrite("DANGER: Gas Leak ");
+                } else {
+                    displayStringWrite("Alarm Triggered!");
+                }
+            } else {
+                displayStringWrite("Input Code:      ");
+            }
+        } else {
+            alarmPromptCountdown = 0;
+
+            if (temporaryViewTimer > 0) {
+                if (temporaryViewType == 1) {
+                    displayStringWrite(gasDetectorStateRead() ? "Gas Alert: YES   " : "Gas Alert: NO    ");
+                } else if (temporaryViewType == 2) {
+                    char msg[16];
+                    sprintf(msg, "Temp Now: %.0f'C", temperatureSensorReadCelsius());
+                    displayStringWrite(msg);
+                }
+            } else if (overTemperatureDetectedRead() || gasDetectedRead()) {
+                if (overTemperatureDetectedRead() && gasDetectedRead()) {
+                    displayStringWrite("DANGER: Temp+Gas!");
+                } else if (overTemperatureDetectedRead()) {
+                    displayStringWrite("DANGER: High Temp");
+                } else {
+                    displayStringWrite("DANGER: Gas Leak ");
+                }
+            } else {
+                displayStringWrite("System Ready     ");
+            }
+        }
+
+    } else {
+        elapsedTime += SYSTEM_TIME_INCREMENT_MS;
+    }
+}
+
+// --- LED updates ---
+static void updateIncorrectCodeLed()
+{
+    incorrectCodeLed = incorrectCodeStateRead();
+}
+
+static void updateSystemBlockedLed()
+{
+    systemBlockedLed = systemBlockedState;
+}
